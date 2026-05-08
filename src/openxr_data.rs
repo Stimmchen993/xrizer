@@ -3,13 +3,13 @@ use crate::{
     graphics_backends::{GraphicsBackend, VulkanData, supported_apis_enum},
 };
 use derive_more::Deref;
-use glam::f32::{Quat, Vec3};
+use glam::f32::{Affine3A, Quat, Vec3};
 use log::{info, warn};
 use openvr as vr;
 use openxr as xr;
 use std::mem::ManuallyDrop;
 use std::sync::{
-    RwLock,
+    LazyLock, RwLock,
     atomic::{AtomicI64, Ordering},
 };
 use std::time::Duration;
@@ -48,6 +48,55 @@ pub struct OpenXrData<C: Compositor> {
     pub(crate) input: Injected<crate::input::Input<C>>,
     pub(crate) compositor: Injected<C>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReclineConfig {
+    enabled: bool,
+    pitch_radians: f32,
+    height_offset_meters: f32,
+}
+
+impl ReclineConfig {
+    fn from_env() -> Self {
+        fn parse_bool(name: &str) -> bool {
+            std::env::var(name)
+                .ok()
+                .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+                .unwrap_or(false)
+        }
+
+        fn parse_f32(name: &str) -> Option<f32> {
+            std::env::var(name).ok().and_then(|value| {
+                value
+                    .parse::<f32>()
+                    .inspect_err(|error| {
+                        warn!("Invalid value for {name}: {value:?} ({error})");
+                    })
+                    .ok()
+            })
+        }
+
+        Self {
+            enabled: parse_bool("XRIZER_RECLINE_MODE"),
+            pitch_radians: parse_f32("XRIZER_RECLINE_PITCH_DEGREES")
+                .unwrap_or(0.0)
+                .to_radians(),
+            height_offset_meters: parse_f32("XRIZER_RECLINE_HEIGHT_OFFSET_METERS").unwrap_or(0.0),
+        }
+    }
+}
+
+static RECLINE_CONFIG: LazyLock<ReclineConfig> = LazyLock::new(|| {
+    let config = ReclineConfig::from_env();
+    if config.enabled {
+        info!(
+            "XRIZER recline calibration enabled (pitch_trim_deg: {}, height_offset_m: {})",
+            config.pitch_radians.to_degrees(),
+            config.height_offset_meters,
+        );
+    }
+    config
+});
 
 impl<C: Compositor> Drop for OpenXrData<C> {
     fn drop(&mut self) {
@@ -269,6 +318,8 @@ impl<C: Compositor> OpenXrData<C> {
             ..
         } = &mut **guard;
 
+        let recline_config = *RECLINE_CONFIG;
+
         let reset_space = |ref_space, adjusted_space: &mut xr::Space, ty| {
             let xr::Posef {
                 position,
@@ -278,30 +329,23 @@ impl<C: Compositor> OpenXrData<C> {
                 .unwrap()
                 .pose;
 
-            // Only set the rotation around the y axis
-            let (twist, _) = swing_twist_decomposition(
-                Quat::from_xyzw(orientation.x, orientation.y, orientation.z, orientation.w),
-                Vec3::Y,
-            )
-            .unwrap_or_else(|| {
-                warn!("Couldn't decompose rotation - using identity");
-                (Quat::IDENTITY, Quat::IDENTITY)
-            });
-
-            *adjusted_space = session
-                .create_reference_space(
-                    ty,
-                    xr::Posef {
-                        position,
-                        orientation: xr::Quaternionf {
-                            x: twist.x,
-                            y: twist.y,
-                            z: twist.z,
-                            w: twist.w,
+            let adjusted_pose =
+                if origin == vr::ETrackingUniverseOrigin::Seated && recline_config.enabled {
+                    recline_reference_pose(
+                        xr::Posef {
+                            position,
+                            orientation,
                         },
-                    },
-                )
-                .unwrap();
+                        recline_config,
+                    )
+                } else {
+                    default_reference_pose(xr::Posef {
+                        position,
+                        orientation,
+                    })
+                };
+
+            *adjusted_space = session.create_reference_space(ty, adjusted_pose).unwrap();
         };
 
         match origin {
@@ -360,6 +404,70 @@ impl<C: Compositor> OpenXrData<C> {
                 state = s;
             }
         }
+    }
+}
+
+fn default_reference_pose(current_pose: xr::Posef) -> xr::Posef {
+    // Default seated reset keeps only yaw, matching xrizer's historic behavior.
+    let orientation = Quat::from_xyzw(
+        current_pose.orientation.x,
+        current_pose.orientation.y,
+        current_pose.orientation.z,
+        current_pose.orientation.w,
+    );
+    let (twist, _) = swing_twist_decomposition(orientation, Vec3::Y).unwrap_or_else(|| {
+        warn!("Couldn't decompose rotation - using identity");
+        (Quat::IDENTITY, Quat::IDENTITY)
+    });
+
+    xr::Posef {
+        position: current_pose.position,
+        orientation: xr::Quaternionf {
+            x: twist.x,
+            y: twist.y,
+            z: twist.z,
+            w: twist.w,
+        },
+    }
+}
+
+fn recline_reference_pose(current_pose: xr::Posef, config: ReclineConfig) -> xr::Posef {
+    let current = pose_to_affine(current_pose);
+    let desired = Affine3A::from_rotation_translation(
+        Quat::from_rotation_x(config.pitch_radians),
+        Vec3::new(0.0, config.height_offset_meters, 0.0),
+    );
+
+    affine_to_pose(current * desired.inverse())
+}
+
+fn pose_to_affine(pose: xr::Posef) -> Affine3A {
+    Affine3A::from_rotation_translation(
+        Quat::from_xyzw(
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ),
+        Vec3::new(pose.position.x, pose.position.y, pose.position.z),
+    )
+}
+
+fn affine_to_pose(affine: Affine3A) -> xr::Posef {
+    let (_, rotation, translation) = affine.to_scale_rotation_translation();
+
+    xr::Posef {
+        position: xr::Vector3f {
+            x: translation.x,
+            y: translation.y,
+            z: translation.z,
+        },
+        orientation: xr::Quaternionf {
+            x: rotation.x,
+            y: rotation.y,
+            z: rotation.z,
+            w: rotation.w,
+        },
     }
 }
 
@@ -743,8 +851,12 @@ pub use tests::FakeCompositor;
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameStream, GraphicsBackend, OpenXrData, SessionCreateInfo};
+    use super::{
+        FrameStream, GraphicsBackend, OpenXrData, ReclineConfig, SessionCreateInfo, affine_to_pose,
+        default_reference_pose, pose_to_affine, recline_reference_pose,
+    };
     use crate::clientcore::Injector;
+    use glam::{Affine3A, Quat, Vec3};
     use openxr as xr;
     use std::ffi::CStr;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -834,5 +946,64 @@ mod tests {
 
         drop(data); // Session must be dropped before Vulkan data.
         drop(comp);
+    }
+
+    #[test]
+    fn default_reference_pose_keeps_yaw_only() {
+        let current = xr::Posef {
+            position: xr::Vector3f {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            orientation: {
+                let rotation = Quat::from_rotation_y(0.7) * Quat::from_rotation_x(1.1);
+                xr::Quaternionf {
+                    x: rotation.x,
+                    y: rotation.y,
+                    z: rotation.z,
+                    w: rotation.w,
+                }
+            },
+        };
+
+        let adjusted = default_reference_pose(current);
+        let adjusted_rotation = Quat::from_xyzw(
+            adjusted.orientation.x,
+            adjusted.orientation.y,
+            adjusted.orientation.z,
+            adjusted.orientation.w,
+        );
+
+        let (_, pitch, roll) = adjusted_rotation.to_euler(glam::EulerRot::YXZ);
+        assert!(pitch.abs() < 0.0001);
+        assert!(roll.abs() < 0.0001);
+        assert_eq!(adjusted.position, current.position);
+    }
+
+    #[test]
+    fn recline_reference_pose_preserves_requested_trim() {
+        let current = affine_to_pose(Affine3A::from_rotation_translation(
+            Quat::from_rotation_z(0.4) * Quat::from_rotation_x(1.2),
+            Vec3::new(0.3, -0.2, 0.8),
+        ));
+        let config = ReclineConfig {
+            enabled: true,
+            pitch_radians: 0.25,
+            height_offset_meters: 0.15,
+        };
+
+        let adjusted = recline_reference_pose(current, config);
+        let resolved = pose_to_affine(adjusted).inverse() * pose_to_affine(current);
+        let expected = Affine3A::from_rotation_translation(
+            Quat::from_rotation_x(config.pitch_radians),
+            Vec3::new(0.0, config.height_offset_meters, 0.0),
+        );
+
+        let (_, resolved_rotation, resolved_translation) = resolved.to_scale_rotation_translation();
+        let (_, expected_rotation, expected_translation) = expected.to_scale_rotation_translation();
+
+        assert!(resolved_rotation.abs_diff_eq(expected_rotation, 0.0001));
+        assert!(resolved_translation.abs_diff_eq(expected_translation, 0.0001));
     }
 }
