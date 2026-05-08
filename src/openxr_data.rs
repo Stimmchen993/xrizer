@@ -8,6 +8,7 @@ use log::{info, warn};
 use openvr as vr;
 use openxr as xr;
 use std::mem::ManuallyDrop;
+use std::path::PathBuf;
 use std::sync::{
     LazyLock, RwLock,
     atomic::{AtomicI64, Ordering},
@@ -49,11 +50,12 @@ pub struct OpenXrData<C: Compositor> {
     pub(crate) compositor: Injected<C>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ReclineConfig {
     enabled: bool,
     pitch_radians: f32,
     height_offset_meters: f32,
+    command_path: Option<PathBuf>,
 }
 
 impl ReclineConfig {
@@ -82,6 +84,7 @@ impl ReclineConfig {
                 .unwrap_or(0.0)
                 .to_radians(),
             height_offset_meters: parse_f32("XRIZER_RECLINE_HEIGHT_OFFSET_METERS").unwrap_or(0.0),
+            command_path: crate::xrizer_state_dir().map(|path| path.join("recline-command.txt")),
         }
     }
 }
@@ -94,9 +97,18 @@ static RECLINE_CONFIG: LazyLock<ReclineConfig> = LazyLock::new(|| {
             config.pitch_radians.to_degrees(),
             config.height_offset_meters,
         );
+        if let Some(path) = &config.command_path {
+            info!("XRIZER recline command path: {}", path.display());
+        }
     }
     config
 });
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrackingSpaceResetMode {
+    Default,
+    Recline,
+}
 
 impl<C: Compositor> Drop for OpenXrData<C> {
     fn drop(&mut self) {
@@ -307,6 +319,61 @@ impl<C: Compositor> OpenXrData<C> {
     }
 
     pub fn reset_tracking_space(&self, origin: vr::ETrackingUniverseOrigin) {
+        self.reset_tracking_space_with_mode(origin, TrackingSpaceResetMode::Default);
+    }
+
+    pub fn maybe_apply_recline_command(&self) {
+        let config = &*RECLINE_CONFIG;
+        if !config.enabled {
+            return;
+        }
+
+        let Some(path) = &config.command_path else {
+            return;
+        };
+
+        let Ok(command) = std::fs::read_to_string(path) else {
+            return;
+        };
+
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "Failed to remove processed recline command file {}: {error}",
+                path.display()
+            );
+        }
+
+        match command.trim() {
+            "calibrate-seated" => {
+                info!("Applying external recline calibration for seated tracking space");
+                self.reset_tracking_space_with_mode(
+                    vr::ETrackingUniverseOrigin::Seated,
+                    TrackingSpaceResetMode::Recline,
+                );
+            }
+            "reset-seated" => {
+                info!("Resetting seated tracking space to native xrizer behavior");
+                self.reset_tracking_space_with_mode(
+                    vr::ETrackingUniverseOrigin::Seated,
+                    TrackingSpaceResetMode::Default,
+                );
+            }
+            "" => {}
+            other => {
+                warn!(
+                    "Unknown recline command {other:?}; expected calibrate-seated or reset-seated"
+                );
+            }
+        }
+    }
+
+    fn reset_tracking_space_with_mode(
+        &self,
+        origin: vr::ETrackingUniverseOrigin,
+        mode: TrackingSpaceResetMode,
+    ) {
         let mut guard = self.session_data.0.write().unwrap();
         let SessionData {
             session,
@@ -317,8 +384,7 @@ impl<C: Compositor> OpenXrData<C> {
             stage_space_adjusted,
             ..
         } = &mut **guard;
-
-        let recline_config = *RECLINE_CONFIG;
+        let recline_config = RECLINE_CONFIG.clone();
 
         let reset_space = |ref_space, adjusted_space: &mut xr::Space, ty| {
             let xr::Posef {
@@ -329,21 +395,16 @@ impl<C: Compositor> OpenXrData<C> {
                 .unwrap()
                 .pose;
 
-            let adjusted_pose =
-                if origin == vr::ETrackingUniverseOrigin::Seated && recline_config.enabled {
-                    recline_reference_pose(
-                        xr::Posef {
-                            position,
-                            orientation,
-                        },
-                        recline_config,
-                    )
-                } else {
-                    default_reference_pose(xr::Posef {
-                        position,
-                        orientation,
-                    })
-                };
+            let current_pose = xr::Posef {
+                position,
+                orientation,
+            };
+            let adjusted_pose = match mode {
+                TrackingSpaceResetMode::Default => default_reference_pose(current_pose),
+                TrackingSpaceResetMode::Recline => {
+                    recline_reference_pose(current_pose, &recline_config)
+                }
+            };
 
             *adjusted_space = session.create_reference_space(ty, adjusted_pose).unwrap();
         };
@@ -431,7 +492,7 @@ fn default_reference_pose(current_pose: xr::Posef) -> xr::Posef {
     }
 }
 
-fn recline_reference_pose(current_pose: xr::Posef, config: ReclineConfig) -> xr::Posef {
+fn recline_reference_pose(current_pose: xr::Posef, config: &ReclineConfig) -> xr::Posef {
     let current = pose_to_affine(current_pose);
     let desired = Affine3A::from_rotation_translation(
         Quat::from_rotation_x(config.pitch_radians),
@@ -991,9 +1052,10 @@ mod tests {
             enabled: true,
             pitch_radians: 0.25,
             height_offset_meters: 0.15,
+            command_path: None,
         };
 
-        let adjusted = recline_reference_pose(current, config);
+        let adjusted = recline_reference_pose(current, &config);
         let resolved = pose_to_affine(adjusted).inverse() * pose_to_affine(current);
         let expected = Affine3A::from_rotation_translation(
             Quat::from_rotation_x(config.pitch_radians),

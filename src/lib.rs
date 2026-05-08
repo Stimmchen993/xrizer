@@ -21,6 +21,7 @@ mod error_dialog;
 use clientcore::ClientCore;
 use openvr as vr;
 use std::ffi::{CStr, c_char, c_void};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
@@ -99,6 +100,13 @@ macro_rules! atomic_float {
 atomic_float!(AtomicF32, f32, AtomicU32);
 atomic_float!(AtomicF64, f64, AtomicU64);
 
+pub(crate) fn xrizer_state_dir() -> Option<PathBuf> {
+    let state_dir = std::env::var("XDG_STATE_HOME")
+        .or_else(|_| std::env::var("HOME").map(|h| h + "/.local/state"))
+        .ok()?;
+    Some(Path::new(&state_dir).join("xrizer"))
+}
+
 fn init_logging() {
     static ONCE: std::sync::Once = std::sync::Once::new();
 
@@ -109,8 +117,6 @@ fn init_logging() {
 
         #[cfg(not(test))]
         {
-            use std::path::Path;
-
             struct ComboWriter(std::fs::File, std::io::Stderr);
 
             impl std::io::Write for ComboWriter {
@@ -125,11 +131,7 @@ fn init_logging() {
                 }
             }
 
-            let state_dir = std::env::var("XDG_STATE_HOME")
-                .or_else(|_| std::env::var("HOME").map(|h| h + "/.local/state"));
-
-            if let Ok(state) = state_dir {
-                let path = Path::new(&state).join("xrizer");
+            if let Some(path) = xrizer_state_dir() {
                 let mut setup = || {
                     let path = path.join("xrizer.txt");
                     match std::fs::File::create(path) {

@@ -84,11 +84,15 @@ _XRIZER_CUSTOM_BINDINGS_DIR_ - This can be used to supply a directory that xrize
 
 _XRIZER_TRACKER_SERIALS_ - This is a semi-colon (`;`) separated list of device serial numbers to use as generic trackers. Can be used to assign controllers as FBT trackers.
 
-_XRIZER_RECLINE_MODE_ - Set this to `1`, `true`, `yes`, or `on` to change `ResetSeatedZeroPose` into a reclined seated calibration. When enabled, xrizer captures the full current head pose instead of only flattening yaw, so a user can recenter while lying down and have the app treat that pose as their neutral seated orientation.
+_XRIZER_RECLINE_MODE_ - Set this to `1`, `true`, `yes`, or `on` to enable xrizer's experimental external recline calibration commands. This does not replace native recentering. Instead, xrizer watches `$XDG_STATE_HOME/xrizer/recline-command.txt` (or `$HOME/.local/state/xrizer/recline-command.txt`) for separate commands.
 
 _XRIZER_RECLINE_PITCH_DEGREES_ - Optional pitch trim, in degrees, applied after reclined seated calibration. Positive values pitch the neutral pose upward.
 
 _XRIZER_RECLINE_HEIGHT_OFFSET_METERS_ - Optional vertical offset, in meters, applied after reclined seated calibration.
+
+When recline mode is enabled, write one of these commands into the recline command file:
+- `calibrate-seated` - Capture the current head pose as a reclined seated neutral pose.
+- `reset-seated` - Restore xrizer's normal seated reset behavior for the seated tracking space.
 
 # See also
 
